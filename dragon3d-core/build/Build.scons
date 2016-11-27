@@ -1,0 +1,811 @@
+#!/usr/bin/env python
+import sys
+import os
+import imp
+from glob import glob
+from SCons.Script import *
+from dragon import *
+
+#######################################################
+# target build append source exts config
+#######################################################
+TARGET_BUILD_SOURCE_AUTO_APPEND_SUFFIXS_MAP = DEFAULT_TARGET_BUILD_SOURCE_AUTO_APPEND_SUFFIXS_MAP
+
+#######################################################
+# reusable functions and data structures
+#######################################################
+def LoadTool(name, env, **kw):
+    #config_path = GetBuildPath('#/build/tools/scons')
+    config_path = GetBuildPath(project.getBase() + '/build/tools/scons')
+    
+    file, path, desc = imp.find_module(name, [config_path])
+    module = imp.load_module(name, file, path, desc)
+    module.generate(env, **kw)
+    
+def MergeListUnique(item_list, items):
+    for item in items: 
+        if not item in item_list: item_list.append(item)
+
+def MergeItemUnique(item_list, item):
+    if not item in item_list: item_list.append(item)
+
+def GlobSources(drct, patterns, excluded_files=[]):
+    #root = GetBuildPath('#'+drct)
+    root = GetBuildPath(project.getBase() + '/' + drct)
+
+    files = []
+    for pattern in Split(patterns):
+        files += glob(root+'/'+pattern)
+    return [drct+'/'+os.path.basename(x) for x in  files if os.path.basename(x) not in excluded_files]
+
+def GlobTargetSources(drct, patterns, excluded_files=[]):
+    source_files = GlobSources(drct, patterns, excluded_files)
+    new_files = []
+
+    for source_file in source_files:
+        if source_file:
+            new_files += AddPlatformTargetSource(project, source_file)
+
+    return new_files
+
+def GetDirPath(dir):
+    return project.getBase() + '/' + dir
+    #return '#/' + dir
+
+def GetDirPaths(paths):
+    dirs = []
+    for path in Split(paths):
+        dirs += [GetDirPath(path)]
+    return dirs
+
+def DeclareBuildDir(dir):
+    env.VariantDir(dir, GetDirPath(dir), duplicate=0)
+    
+def GetIncludeDirs(modules, exclude=None):
+    dirs = []
+    for module in Split(modules):
+        if project.hasModule(module) and not module == exclude:
+            dirs += project.getModule(module).GetIncludeDirs()
+        else:
+            dirs += [GetDirPath(module)]
+    return dirs
+
+def GetLibrarieDirs(modules, exclude=None):
+    dirs = []
+    for module in Split(modules):
+        if project.hasModule(module) and not module == exclude:
+            dirs += project.getModule(module).GetLibrarieDirs()
+    return dirs
+
+
+def GetLibraries(modules):
+    libs = []
+    for module in Split(modules):
+        if project.hasModule(module):
+            libs += project.getModule(module).GetLibraries()
+        else:
+            libs += [module]
+    return libs
+
+def GetBuildDirPath():
+    return project.getBase() + '/build/targets/' + env['target'] + "/" + env['build_config']
+
+
+def GetBuildTargetDir():
+    return project.getBase() + '/targets/' + env['target'] + "/" + env['build_config']
+
+
+class Module:
+    def __init__(self, name, build_include_dirs = [], included_modules = [], 
+        build_lib_dirs  = [], linked_modules = []):
+        self.name               = name
+
+        # store this new object in the module dictionary
+        project.addModule(name, self)
+
+        self.include_dirs       = build_include_dirs
+        self.lib_path           = build_lib_dirs
+        self.included_modules   = included_modules
+        self.linked_modules     = linked_modules
+
+        self.product            = []
+
+    def GetProduct(self):
+        return self.product
+
+    def GetLibraries(self):
+        return [self.name] + GetLibraries(self.linked_modules)
+
+    def GetLinkedLibraries(self):
+        return GetLibraries(self.linked_modules)
+
+    def GetIncludeDirs(self):
+        return GetIncludeDirs(self.include_dirs + self.included_modules + self.linked_modules, self.name)
+
+    def GetLibrarieDirs(self):
+        return [GetBuildTargetDir()] + GetDirPaths(self.lib_path) + GetLibrarieDirs(self.included_modules + self.linked_modules, self.name)
+
+class LibraryModule(Module):
+    def __init__(self, name, 
+                 source_root           = 'Source',
+                 build_source_dirs     = ['.'], 
+                 build_source_pattern  = ['*.c', '*.cpp', '*.cc'], 
+                 build_source_files    = {},
+                 excluded_files        = [],
+
+                 build_include_dirs    = [], 
+                 build_lib_dirs        = [], 
+
+                 included_modules      = [], 
+                 included_only_modules = [],
+                 linked_modules        = [],
+
+                 extra_cpp_defines     = [],
+
+                 environment           = None,
+                 conditions            = None,
+                 shared                = False,
+                 install               = False) :
+        Module.__init__(self, 
+                        name, 
+                        Split(build_include_dirs),
+                        Split(included_modules) + Split(included_only_modules), 
+                        Split(build_lib_dirs),
+                        Split(linked_modules))
+        self.source_root = source_root
+        self.defines = extra_cpp_defines
+        self.sources = self.CalBuildSources(build_source_dirs, build_source_pattern, build_source_files, excluded_files)
+        self.shared = shared
+        
+        if environment is None:
+            self.env = env.Clone()
+        else:
+            self.env = environment.Clone()
+
+        # conditions
+        self.AppendConditions(conditions)
+
+        # build config
+        libs = self.GetLinkedLibraries()
+        lib_paths = self.GetLibrarieDirs()
+        include_path = self.GetIncludeDirs()
+        sources = self.GetSources()
+        defines = self.GetDefines()
+        
+        # the product is a library
+        self.env.AppendUnique(CPPDEFINES = defines)
+        self.env.AppendUnique(CPPPATH = include_path)
+        self.env.AppendUnique(LIBPATH = lib_paths)
+
+        #PDB
+        if self.env['build_config'] == "debug":
+            self.env['PDB'] = name + '.pdb'
+
+        # pre processor
+        if env.has_key('DRAGON_MODULE_PRE_PROCESSOR'):
+            if (not env['DRAGON_MODULE_PRE_PROCESSOR'](target=name, source= sources, env=env)):
+                return;
+
+        if shared is False:
+            self.product = self.env.Library(target=name, LIBS=libs, source=sources)
+        else:
+            self.product = self.env.SharedLibrary(target=name, LIBS=libs, source=sources)
+            
+        # post processor
+        if env.has_key('DRAGON_MODULE_POST_PROCESSOR'):
+            if (not env['DRAGON_MODULE_POST_PROCESSOR'](target=name, prog= self.product, env=env)):
+                return;
+
+        self.env.Alias(name, self.product)
+
+        # copy to Targets folder
+        if install is True:
+            #inst = env.Install(dir=env.GetBuildPath('#/targets/'+env['target']+'/'+env['build_config']), source=self.product)
+            inst = env.Install(dir=env.GetBuildPath(project.getBase() + '/targets/'+env['target']+'/'+env['build_config']), source=self.product)
+            if env['build_config'] == 'release' and env.has_key('STRIP'):
+                env.AddPostAction(inst, env['STRIP']+' $TARGETS');
+
+            env.Install(dir=env.GetBuildPath('#/' + LIB_REPO_PATH + '/' + env['target'] + '/' + env['build_config']), source=self.product)
+ 
+    def GetLibraries(self):
+        if sys.platform == "win32" and self.shared and len(self.product) > 0:
+          libs = [];
+          libs.append(self.name)
+          libs += GetLibraries(self.linked_modules)  
+          return libs
+        else:
+          return [self.name] + GetLibraries(self.linked_modules)
+
+    # for each source drct to build, create a VariantDir
+    # to say where we want the object files to be built,
+    # and compute the list of source files to build
+    def CalBuildSources(self, build_source_dirs, build_source_pattern, build_source_files, excluded_files):
+        sources = []
+
+        build_source_dirs = [self.source_root+'/'+drct for drct in build_source_dirs]
+
+        for drct in Split(build_source_dirs):
+            DeclareBuildDir(drct)
+            sources += GlobTargetSources(drct, build_source_pattern, excluded_files)
+            
+        # add cherry-picked files
+        for drct in build_source_files.keys():
+            pattern = build_source_files[drct]
+            drct_path = self.source_root+'/'+drct
+            DeclareBuildDir(drct_path)
+            sources += GlobTargetSources(drct_path, pattern)
+
+        return sources
+
+    def GetSources(self):
+        return self.sources
+
+    def GetDefines(self):
+        return self.defines
+
+    def AppendConditions(self, conditions):
+        if conditions:
+            for condition in conditions.keys():
+                config = conditions[condition]
+                parts = condition.split("=")
+                ctype = parts[0]
+                cval = parts[1]
+
+                #print "curent target:", env['target']
+                #print "condition:", condition
+                #print "config:", config
+
+                if ctype == 'TARGET':
+                    if cval == env['target']:
+                        self.AppendBuildConfig(config)
+                elif ctype == 'OS':
+                    if OSMatchTarget(cval, env['target']):
+                        self.AppendBuildConfig(config)
+                elif ctype == 'ARCH':
+                    if ArchMatchTarget(cval, env['target']):
+                        self.AppendBuildConfig(config)
+                else:
+                    raise Exception('not match confition type! for ' + ctype)
+
+
+    def AppendBuildConfig(self, config):
+        #print "match config:", config
+
+        if ('sources' in config):
+            self.sources += self.CalBuildSources([], [], config['sources'], [])
+        
+        if ('include_dirs' in config):
+            self.include_dirs += config['include_dirs']
+
+        if ('defines' in config):
+            self.defines += config['defines']
+
+        if ('dependencies' in config):
+            self.linked_modules += config['dependencies']
+
+        if ('lib_path' in config):
+            self.lib_path += config['lib_path']
+
+        #print self.include_dirs;
+
+
+def Application(name, 
+                source_root           = 'Source',
+                build_source_dirs     = ['.'], 
+                build_source_files    = {},
+                build_source_pattern  = ['*.c', '*.cpp'], 
+                excluded_files        = [],
+                build_include_dirs    = [], 
+                build_lib_dirs        = [],                 
+                deps                  = [], 
+                install               = False):
+    build_source_dirs = [source_root+'/'+drct for drct in build_source_dirs]
+
+    libs = GetLibraries(deps)
+    #print "libs:", libs
+
+    cpp_paths = GetIncludeDirs(Split(build_include_dirs) + deps)
+    #print "cpp_paths:", cpp_paths
+
+    lib_paths = GetDirPaths(Split(build_lib_dirs)) + GetLibrarieDirs(deps)
+    #print "lib_paths:", lib_paths
+
+    env.AppendUnique(LIBPATH = lib_paths)
+
+    # for each source drct to build, create a VariantDir
+    # to say where we want the object files to be built,
+    # and compute the list of source files to build
+    sources = []
+    for drct in Split(build_source_dirs):
+        DeclareBuildDir(drct)
+        sources += GlobTargetSources(drct, build_source_pattern, excluded_files)
+
+    # add cherry-picked files
+    for drct in build_source_files.keys():
+        pattern = build_source_files[drct]
+        drct_path = source_root+'/'+drct
+
+        DeclareBuildDir(drct_path)
+        sources += GlobTargetSources(drct_path, pattern)
+
+    sources = sources + env['DRAGON_EXTRA_EXECUTABLE_OBJECTS']
+
+    # pre processor
+    if env.has_key('DRAGON_MODULE_PRE_PROCESSOR'):
+        if (not env['DRAGON_MODULE_PRE_PROCESSOR'](target=name, source= sources, env=env)):
+            return;
+
+    prog = env.Program(target=name, 
+                       source= sources,
+                       LIBS=libs, CPPPATH=cpp_paths)
+
+    # post processor
+    if env.has_key('DRAGON_MODULE_POST_PROCESSOR'):
+        if (not env['DRAGON_MODULE_POST_PROCESSOR'](target=name, prog= prog, env=env)):
+            return;
+    
+    # copy to Targets folder
+    if install is True:
+        #inst = env.Install(dir=env.GetBuildPath('#/targets/'+env['target']+'/'+env['build_config']), source=prog)
+        inst = env.Install(dir=env.GetBuildPath(project.getBase() + '/targets/' + env['target'] + '/'+env['build_config']), source=prog)
+        if env['build_config'] == 'release' and env.has_key('STRIP'):
+            env.AddPostAction(inst, env['STRIP']+' $TARGETS');
+
+    if env["test"] or env["debug"]:
+        env.RunProgram(target= "#run-" + name, source=inst)
+
+
+### Add Test Builder
+def RunTarget(target, source, env):
+    if env.has_key("BEFORE_RUN_FUNC"):
+        env['BEFORE_RUN_FUNC'](target, source, env)
+
+    if env.has_key('RUN_FUNC'):
+        env["RUN_FUNC"](target, source, env)
+
+    if env.has_key('AFTER_RUN_FUNC'):
+        env['AFTER_RUN_FUNC'](target, source, env)
+
+    return None
+
+
+
+
+#######################################################
+# Main Build
+#######################################################
+Import("env")
+Import('project')
+
+project = Project(env, project)
+project.init()
+
+### defaults
+env['DRAGON_EXTRA_LIBS'] = []
+env['DRAGON_EXTRA_EXECUTABLE_OBJECTS'] = []
+
+if (env['build_config'] == 'debug'):
+    env.AppendUnique(CPPDEFINES=['DRAGON_DEBUG', 'DRAGON_CONFIG_ENABLE_LOGGING'])
+else:
+    env.AppendUnique(CPPDEFINES=['NDEBUG', 'DRAGON_CONFIG_ENABLE_LOGGING'])
+
+### setup test enviriment
+runBuilder = env.Builder(action = RunTarget, 
+    target_factory=SCons.Node.FS.default_fs.Entry,
+    multi=0)
+env['BUILDERS']['RunProgram'] = runBuilder
+
+### default library type
+if (env['lib_type'] == 'static'):
+    env['SHARED'] = False
+elif(env['lib_type'] == 'shared'):
+    env['SHARED'] = True
+else:
+    raise Exception('the lib type is not assign!')
+    
+### try to read in any target specific configuration
+#target_config_file = env.GetBuildPath('#/build/targets/'+env['target']+'/Config.scons')
+target_config_file = env.GetBuildPath(project.getBase() + '/build/targets/'+env['target']+'/Config.scons')
+if os.path.exists(target_config_file):
+    # Load the target-specific config file    
+    execfile(target_config_file)
+
+#######################################################
+# modules
+#
+# Usage:
+#
+# The LibraryModule() function declares a code module
+# The included_modules parameter is a list of all the modules and/or directories
+# that will be added to the include path when building this module AND to
+# the include path of any other module that depends on this one.
+# The linked_modules parameter is a list of all the modules and/or directories
+# that are necessary to build this module. These modules will be added to
+# the include path of this module, but not to that of the modules that depend
+# on this module. The modules that depend on this module, however, will 
+# automatically link with the linked_modules. 
+# Note that the included_modules list is automatically added to the 
+# linked_modules list, so that you do not need to list in linked_modules
+# the modules that are already listed in included_modules.
+# If a module needs to export an include path to its dependents that
+# is not a module that the dependent can link with (ex: an include dir),
+# list it in the included_only_modules.
+# To summarize: included_modules should list all the modules that users
+# of the public interface should depend on; linked_modules should list
+# all the modules not listed in included_modules that are used by the
+# module's implementation only.
+#######################################################
+
+# Build Config
+THIRD_PARTY_SOURCE_ROOT = '../../third_party'
+
+# delaunay lib
+LibraryModule(
+    name                  = 'delaunay',
+    build_include_dirs    = [
+        THIRD_PARTY_SOURCE_ROOT + "/Delaunay",
+    ],  
+    source_root           = THIRD_PARTY_SOURCE_ROOT,
+    build_source_dirs     = ['Delaunay'],
+    shared                = False,
+    install               = True
+)
+
+# lib openal
+mob_SOURCES = Split("""
+    alConfigMob.c
+""")
+
+OpenAL32_SOURCES = Split("""
+    alAuxEffectSlot.c
+    alBuffer.c
+    alEffect.c
+    alError.c
+    alExtension.c
+    alFilter.c
+    alListener.c
+    alSource.c
+    alState.c
+    alThunk.c
+""")
+
+Alc_SOURCES = Split("""
+    ALc.c
+    ALu.c
+    alcConfig.c
+    alcDedicated.c
+    alcEcho.c
+    alcModulator.c
+    alcReverb.c
+    alcRing.c
+    alcThread.c
+    bs2b.c
+    helpers.c
+    panning.c
+    hrtf.c
+    mixer.c
+    mixer_c.c
+""")
+
+Alc_coreaudio_backends_SOURCES = Split("""
+    null.c
+    wave.c
+    loopback.c
+    coreaudio.c
+""")
+
+Alc_opensl_backends_SOURCES = Split("""
+    null.c
+    wave.c
+    loopback.c
+    opensl.c
+""")
+
+OPENAL_SOFT_ROOT = THIRD_PARTY_SOURCE_ROOT + "/OpenAL-MOB-1.0.0"
+
+LibraryModule(
+    name                  = 'openal',
+    source_root           = OPENAL_SOFT_ROOT,
+    build_include_dirs    = [
+        OPENAL_SOFT_ROOT + "/mob/include",
+        OPENAL_SOFT_ROOT + "/OpenAL32/include",
+        OPENAL_SOFT_ROOT + "/include"
+    ],  
+    build_source_dirs     = [],         
+    build_source_files    = {
+        "OpenAL32" : OpenAL32_SOURCES,
+        "Alc" : Alc_SOURCES,
+        "mob" : mob_SOURCES
+    },    
+    extra_cpp_defines     = [
+        "AL_ALEXT_PROTOTYPES",
+        "MOB_IGNORE_CONFIG_FILE",
+        "TARGET_OS_IPHONE"
+    ],
+
+    conditions = {
+        "OS=mac" : {
+            "sources" : {
+                "Alc/backends" : Alc_coreaudio_backends_SOURCES
+            }
+        },
+        "OS=ios" : {
+            "include_dirs" : [
+                OPENAL_SOFT_ROOT + "/build_ios"
+            ]
+        },
+        "OS=osx" : {
+            "include_dirs" : [
+                OPENAL_SOFT_ROOT + "/build_mac"
+            ]
+        },
+        "OS=android" : {
+            "include_dirs" : [
+                OPENAL_SOFT_ROOT + "/build_android/jni"
+            ],
+            "sources" : {
+                "Alc/backends" : Alc_opensl_backends_SOURCES
+            }
+        }
+    },
+
+    shared                = False,                    
+    install               = True
+)
+
+
+# lib 3ds
+lib3ds_la_SOURCES = Split("""
+  io.c \
+  vector.c \
+  matrix.c \
+  quat.c \
+  tcb.c \
+  ease.c \
+  chunktable.h \
+  chunk.c \
+  file.c \
+  background.c \
+  atmosphere.c \
+  shadow.c \
+  viewport.c \
+  material.c \
+  mesh.c \
+  camera.c \
+  light.c \
+  tracks.c \
+  node.c
+""")
+
+LibraryModule(
+    name                  = '3ds',
+    build_include_dirs    = [
+        THIRD_PARTY_SOURCE_ROOT + "/lib3ds-1.3.0",
+    ],  
+    source_root           = THIRD_PARTY_SOURCE_ROOT + "/lib3ds-1.3.0",
+    build_source_files    = {
+        "lib3ds" : lib3ds_la_SOURCES
+    },  
+    shared                = False,
+    install               = True
+)
+
+# dragon3d-core
+dragon3d_core_SOURCES = {
+    "com/dragon3d" : Split("""
+        config.cc
+    """),
+
+    "com/dragon3d/launcher" : Split("""
+        AppLauncher.cc
+    """),
+    "com/dragon3d/framework" : Split("""
+        Application.cc
+        FrameHandler.cc
+        GameException.cc
+    """),
+
+    "com/dragon3d/scene" : Split("""
+        GameObject.cc
+        Component.cc
+        Transform.cc
+        Behaviour.cc
+
+        AbstractScene.cc
+        SimpleScene.cc
+
+        Shader.cc
+        Bounds.cc
+    """),
+
+    "com/dragon3d/scene/collider" : Split("""
+        Collider.cc
+    """),
+       
+    "com/dragon3d/scene/camera" : Split("""
+        Frustum.cc
+        Camera.cc
+    """),
+
+    "com/dragon3d/scene/model" : Split("""
+        Mesh.cc
+        Texture.cc
+        RenderTexture.cc
+        Material.cc
+        Model.cc
+    """),
+    "com/dragon3d/scene/model/geometry" : Split("""
+        Box.cc
+        Plane.cc
+    """),
+
+    "com/dragon3d/scene/audio" : Split("""
+        AudioSource.cc
+        AudioListener.cc
+    """),
+
+    "com/dragon3d/scene/texture" : Split("""
+        Texture.cc
+    """),
+
+    "com/dragon3d/input" : Split("""
+        InputManager.cc
+    """),
+
+    "com/dragon3d/output" : Split("""
+        OutputManager.cc
+    """),
+    "com/dragon3d/output/graphics" : Split("""
+        GraphicsSettings.cc
+        GraphicsDevice.cc
+        GraphicsOutputController.cc
+        Renderable.cc
+    """),
+
+    "com/dragon3d/output/graphics/renderer" : Split("""
+        support_graphics_renderer.cc
+    """),
+    "com/dragon3d/output/graphics/renderqueue" : Split("""
+        RenderQueue.cc
+    """),
+    "com/dragon3d/output/graphics/shader" : Split("""
+        ShaderException.cc
+        ShaderSource.cc
+        ShaderManager.cc
+        support_shader_compiler.cc
+    """),
+    "com/dragon3d/output/graphics/vbo" : Split("""
+        VBOMeshCache.cc
+        VBOMeshCacheManager.cc
+    """),
+
+    "com/dragon3d/output/graphics/shader/glsl" : Split("""
+        GLSLShader.cc
+        GLSLShaderCompiler.cc
+    """),
+
+    "com/dragon3d/output/audio" : Split("""
+        AudioRenderer.cc
+        AudioOutputController.cc
+        Speaker.cc
+    """),
+
+    "com/dragon3d/util" : Split("""
+        Timer.cc
+    """),
+
+    "com/dragon3d/util/math" : Split("""
+        Vector2.cc
+        Vector3.cc
+        Vector4.cc
+        Color.cc
+        Color32.cc
+        Mathf.cc
+        Quaternion.cc
+        Matrix4x4.cc
+        Ray3.cc
+        Rect.cc
+        Plane.cc
+    """),
+
+    "com/dragon3d/util/intersection" : Split("""
+        RaycastHit.cc
+        PickResults.cc
+    """),
+
+    "com/dragon3d/util/prefab" : Split("""
+        PrefabUtility.cc
+    """),
+
+    "com/dragon3d/util/debug" : Split("""
+        PlacementGrid.cc
+        BoundingBoxOutline.cc
+    """),
+
+    "com/dragon3d/util/assets" : Split("""
+        ResourceNotFoundException.cc
+        Resource.cc
+        AssetsManager.cc
+        ResourceUtils.cc
+    """),
+
+    # model loader
+    "com/dragon3d/util/assets/modelio/plugins/obj" : Split("""
+        ObjMTLLoader.cc
+        ObjModelLoader.cc
+    """),
+    "com/dragon3d/util/assets/modelio/plugins/max" : Split("""
+        Max3DSModelLoader.cc
+    """),
+    "com/dragon3d/util/assets/modelio/spi" : Split("""
+        ModelLoaderRegistry.cc
+    """),
+    "com/dragon3d/util/assets/modelio" : Split("""
+        ModelLoadException.cc
+        ModelIO.cc
+    """)
+
+}
+
+LibraryModule(
+    name                  = 'dragon3d-core',
+    build_include_dirs    = [
+        'include'
+    ],
+    build_source_files    = dragon3d_core_SOURCES,
+    extra_cpp_defines     = [
+        'DRAGON_SHARED', 
+        'BUILDING_DRAGON_SHARED',
+        'ENABLE_LOG'
+    ],
+    source_root           = 'src',
+    linked_modules        = [
+        'dragon',
+        'openal',
+        'delaunay',
+        '3ds'
+    ] + env['DRAGON_EXTRA_LIBS'],
+
+    conditions = {
+        "OS=ios" : {
+            "defines" : ["IOS", "HAVE_OPENGLES", "HAVE_OPENGLES2"]
+        }
+    },
+
+    shared                = env['SHARED'],
+    install               = True
+)
+
+
+# dragon3d-core-test
+dragon3d_core_test_SOURCES = {
+    "com/dragon3d/util/math" : Split("""
+        Vector3Test.cc
+        QuaternionTest.cc
+        Matrix4x4Test.cc
+    """),
+
+    "com/dragon3d/util/assets" : Split("""
+        AssetsManagerTest.cc
+    """),
+
+    "com/dragon3d/util/assets/modelio" : Split("""
+        ModelIOTest.cc
+    """),
+
+    "." : Split("""
+        TestMain.cc
+    """)
+}
+
+Application(
+    name                  = 'dragon3d-core-test', 
+    source_root           = 'test',
+    build_source_files    = dragon3d_core_test_SOURCES,
+    deps                  = [ 
+        'dragon3d-core',
+        'gtest'
+    ],          
+    install               = True
+)
+

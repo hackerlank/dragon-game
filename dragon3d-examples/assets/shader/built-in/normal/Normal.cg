@@ -1,0 +1,24 @@
+void main_vertex
+(
+   uniform float4x4 modelViewProj,
+   float4 position : POSITION,
+   float2 uv : TEXCOORD,
+
+   out float4 oPosition : POSITION,
+   out float2 oUV : TEXCOORD
+)
+{
+   oPosition = mul(modelViewProj, position);
+   oUV = uv;
+}
+
+float4 main_fragment (
+    float2 uv : TEXCOORD, 
+    uniform sampler2D mainTex : TEXUNIT0,
+    uniform float2 mainTexTiling,
+    uniform float2 mainTexOffset,
+    uniform float4 color) : COLOR
+{
+   float2 tiling = float2(uv.x * mainTexTiling.x, uv.y * mainTexTiling.y);
+   return color + tex2D(mainTex, mainTexOffset + tiling);
+}
